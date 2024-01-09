@@ -1,0 +1,22 @@
+{ 
+   "licenseType" : "CC BY-SA",
+   "creatorName" : "Eosin", 
+   "packageName" : "VRRenderer", 
+   "standardReferenceVersionOption" : "Latest", 
+   "scriptReferenceVersionOption" : "Exact", 
+   "description" : "Renders VR180, VR360, BVH and flat images and image sequences in stereo and mono.", 
+   "credits" : "MacGruber, Élie Michel", 
+   "instructions" : "Add to object from which you want to render.", 
+   "promotionalLink" : "", 
+   "programVersion" : "1.20.77.9", 
+   "contentList" : [ 
+      "Custom/Scripts/Eosin"
+   ], 
+   "dependencies" : {
+   }, 
+   "customOptions" : {
+   }, 
+   "hadReferenceIssues" : "false", 
+   "referenceIssues" : [ 
+   ]
+}
