@@ -1,4 +1,4 @@
-﻿/*
+/*
     VR Renderer for Virt-a-Mate
     by Eosin
     License: CC BY-SA
@@ -8,6 +8,8 @@
 
     Uses LilyRender360 shader created by Elie Michel, licensed under MIT License.
     https://github.com/eliemichel/LilyRender360
+    
+    Contains patch for multi-threaded image encoding by yunidatsu.
 	
     v15
 
@@ -394,6 +396,8 @@ namespace Eosin
 
         private const int ASPECT_SQUARE = 6;
 
+        private const int MAX_ENC_THREADS = 16;
+
         private JSONStorableString myMemoryInfo;
         private float myMemoryEstimate = -1.0f;
         private JSONStorableString myDiskSpaceInfo;
@@ -477,6 +481,9 @@ namespace Eosin
         JSONStorableUrl seamTextureUrl;
         JSONStorableColor seamTextureTintChooser;
 
+        JSONStorableBool encThreadsToggle;
+        JSONStorableFloat numEncThreadsSlider;
+
         private int myAspectRatioIdx = DEFAULT_ASPECTRATIO_IDX;
         private int myResolutionIdx = DEFAULT_RESOLUTION_IDX[DEFAULT_ASPECTRATIO_IDX];
         private int myMsaaLevel = MSAA_VALUES[DEFAULT_MSAA_IDX];
@@ -543,7 +550,10 @@ namespace Eosin
         Camera renderCam, previewCamera;
         GameObject renderCamParentObj;
         Material sliceEquirectMat, _equirectMat, _equirectMatAlpha, _equirectMatRotate, _equirectMatRotateTriangle, myConvolutionMaterial, alphaDiffMat;
-        Texture2D finalOutputTexture;
+        Texture2D[] finalOutputTextures;
+        bool encThreadingEnabled;
+        bool[] encThreadFreeFlags;
+        Semaphore encThreadSem;
         RenderTexture equirectL, equirectR;
         RenderTexture flatRenderTex, passTexture, outputRenderTexture;
         RenderTexture flatRenderTexBlack, flatRenderTexWhite, blackBgRenderTex, whiteBgRenderTex;
@@ -708,6 +718,9 @@ namespace Eosin
             renderBackgroundChooser = Utils.SetupToggle(this, "Render Background To Output", true, true);
             backgroundColor = Utils.SetupColor(this, "Background Color", Color.black, true);
             hideBackgroundColorOnPreviewOnly = Utils.SetupToggle(this, "Hide Background Color On Preview Only", false, true);
+            
+            encThreadsToggle = Utils.SetupToggle(this, "Multi-Threaded Encoding", true, true);
+            numEncThreadsSlider = Utils.SetupSliderIntWithRange(this, "Encoder Thread Count", 4, 1, MAX_ENC_THREADS, true);
 
             Utils.SetupAction(this, "TakeSingleScreenshot", TakeSingleScreenshot);
             Utils.SetupAction(this, "StartPlaybackAndRecordVideo", StartPlaybackAndRecordVideo);
@@ -1578,7 +1591,7 @@ namespace Eosin
                 if (bRendering)
                 {
                     if (bFlatRender)
-                        Graphics.DrawTexture(previewRect, finalOutputTexture);
+                        Graphics.DrawTexture(previewRect, finalOutputTextures[0]);
                     else
                         Graphics.DrawTexture(previewRect, equirectL);
                 }
@@ -2253,29 +2266,55 @@ namespace Eosin
         {
             if (!PrepareFrame())
                 return;
+            
+            int curEncThreadIndex = -1;
 
-            RenderFrame();
+            if (encThreadingEnabled)
+            {
+                while (!encThreadSem.WaitOne(100))
+                {
+                }
 
-            ProcessFrame();
+                for (int i = 0; i < encThreadFreeFlags.Length; i++)
+                {
+                    if (encThreadFreeFlags[i])
+                    {
+                        curEncThreadIndex = i;
+                        encThreadFreeFlags[curEncThreadIndex] = false;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                curEncThreadIndex = 0;
+            }
+            
+            if (curEncThreadIndex >= 0)
+            {
+                RenderFrame(curEncThreadIndex);
+
+                ProcessFrame(curEncThreadIndex);
+            }
         }
 
-        void ProcessFrame()
+        void ProcessFrame(int threadIdx)
         {
             if (bFlatRender)
             {
                 if (flatSupersampling > 1)
                 {
                     FlatDownsample();
-                    RenderTexToTex2D(outputRenderTexture, finalOutputTexture);
+                    RenderTexToTex2D(outputRenderTexture, finalOutputTextures[threadIdx]);
                 }
                 else
                 {
-                    RenderTexToTex2D(flatRenderTex, finalOutputTexture);
+                    RenderTexToTex2D(flatRenderTex, finalOutputTextures[threadIdx]);
                 }
             }
             if (bRecordVideo)
             {
-                SaveRenderAsFile(myFileFormat, baseFilename + "_" + frameCounter.ToString("D6"), finalOutputTexture);
+                SaveRenderAsFile(myFileFormat, baseFilename + "_" + frameCounter.ToString("D6"), finalOutputTextures[threadIdx], threadIdx);
 
                 timestamps.Add(Time.realtimeSinceStartup);
 
@@ -2289,7 +2328,7 @@ namespace Eosin
             }
             else
             {
-                SaveRenderAsFile(myFileFormat, baseFilename, finalOutputTexture);
+                SaveRenderAsFile(myFileFormat, baseFilename, finalOutputTextures[threadIdx], threadIdx);
                 EndRender();
                 return;
             }
@@ -2403,7 +2442,7 @@ namespace Eosin
                 return null;
         }
 
-        void RenderFrame()
+        void RenderFrame(int threadIdx)
         {
             renderCam.clearFlags = CameraClearFlags.SolidColor;
             Color color = Color.HSVToRGB(backgroundColor.val.H, backgroundColor.val.S, backgroundColor.val.V);
@@ -2436,11 +2475,11 @@ namespace Eosin
                 }
                 else if (stereoMode == STEREO_PANORAMIC)
                 {
-                    RenderPanoramicStereoMap(renderCam, finalOutputTexture, Vector3.left * ipd / 2000f, b180Degrees ? 180f : 360f);
+                    RenderPanoramicStereoMap(renderCam, finalOutputTextures[threadIdx], Vector3.left * ipd / 2000f, b180Degrees ? 180f : 360f);
                 }
 
                 if (stereoMode != STEREO_PANORAMIC)
-                    MergeSidesToTexture(equirectL, equirectR, finalOutputTexture, b180Degrees);
+                    MergeSidesToTexture(equirectL, equirectR, finalOutputTextures[threadIdx], b180Degrees);
             }
             else
             {
@@ -2463,7 +2502,7 @@ namespace Eosin
                 {
                     RenderCubemap(renderCam, renderFaces, Vector3.zero);
                     CubemapToEquirectShader(renderFaces, equirectL, background);
-                    RenderTexToTex2D(equirectL, finalOutputTexture);
+                    RenderTexToTex2D(equirectL, finalOutputTextures[threadIdx]);
                 }
             }
         }
@@ -2626,7 +2665,25 @@ namespace Eosin
                 + DateTime.Now.Hour.ToString("D2") + DateTime.Now.Minute.ToString("D2") + DateTime.Now.Second.ToString("D2");
         }
 
-        public void SaveRenderAsFile(int fileFormat, string filename, Texture2D tex)
+        public void SaveRenderAsFile(int fileFormat, string filename, Texture2D tex, int threadIdx)
+        {
+            if (encThreadingEnabled)
+            {
+                ThreadPool.QueueUserWorkItem(delegate(object arg)
+                {
+                    SaveRenderAsFileInternal(fileFormat, filename, tex);
+
+                    encThreadFreeFlags[threadIdx] = true;
+                    encThreadSem.Release();
+                });
+            }
+            else
+            {
+                SaveRenderAsFileInternal(fileFormat, filename, tex);
+            }
+        }
+
+        private void SaveRenderAsFileInternal(int fileFormat, string filename, Texture2D tex)
         {
             filename += (fileFormat == FORMAT_JPG) ? ".jpg" : ".png";
             byte[] bytes = (fileFormat == FORMAT_JPG) ? tex.EncodeToJPG(jpegQuality) : tex.EncodeToPNG();
@@ -3285,9 +3342,31 @@ namespace Eosin
 
             int width = finalResolution.x;
             int height = finalResolution.y;
-
+            
             TextureFormat textureFormat = (myFileFormat == FORMAT_JPG || !(preserveTransparencyChooser.val && myFileFormat == FORMAT_PNG)) ? TextureFormat.RGB24 : TextureFormat.ARGB32;
-            finalOutputTexture = new Texture2D(width, height, textureFormat, false);
+
+            int numEncThreads = encThreadsToggle.val ? (int) numEncThreadsSlider.val : 0;
+
+            if (numEncThreads == 0)
+            {
+                encThreadingEnabled = false;
+                finalOutputTextures = new Texture2D[] {new Texture2D(width, height, textureFormat, false)};
+                encThreadFreeFlags = null;
+                encThreadSem = null;
+            }
+            else
+            {
+                encThreadingEnabled = true;
+                finalOutputTextures = new Texture2D[numEncThreads];
+                encThreadFreeFlags = new bool[numEncThreads];
+                encThreadSem = new Semaphore(numEncThreads, numEncThreads);
+
+                for (int i = 0; i < numEncThreads; i++)
+                {
+                    finalOutputTextures[i] = new Texture2D(width, height, textureFormat, false);
+                    encThreadFreeFlags[i] = true;
+                }
+            }
 
             mySelectedController = SuperController.singleton.GetSelectedController();
             SuperController.singleton.ClearSelection();
@@ -3474,7 +3553,34 @@ namespace Eosin
                 audioSources.Clear();
             }
 
-            Destroy(finalOutputTexture);
+            if (encThreadingEnabled)
+            {
+                bool allThreadsDone;
+                do
+                {
+                    encThreadSem.WaitOne(10);
+
+                    allThreadsDone = true;
+                    for (int i = 0; i < encThreadFreeFlags.Length; i++)
+                    {
+                        if (!encThreadFreeFlags[i])
+                        {
+                            allThreadsDone = false;
+                            break;
+                        }
+                    }
+                } while (!allThreadsDone);
+            }
+
+            for (int i = 0; i < finalOutputTextures.Length; i++)
+            {
+                Destroy(finalOutputTextures[i]);
+            }
+
+            finalOutputTextures = null;
+            encThreadFreeFlags = null;
+            encThreadSem = null;
+
             renderCamParentObj.SetActive(false);
 
             myNeedSetup = true;
