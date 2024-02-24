@@ -9,7 +9,7 @@
     Uses LilyRender360 shader created by Elie Michel, licensed under MIT License.
     https://github.com/eliemichel/LilyRender360
     
-    Contains patch for multi-threaded image encoding by yunidatsu.
+    Contains patch for multi-threaded image encoding and TCP video streaming by yunidatsu.
 	
     v15
 
@@ -166,6 +166,8 @@ using System.Collections.Generic;
 using System.Text;
 using System;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using MeshVR;
 using MVR.FileManagementSecure;
 using MacGruber;
@@ -382,8 +384,13 @@ namespace Eosin
         public static readonly List<int> MSAA_VALUES = new List<int>() { 1, 2, 4, 8 };
         public static readonly List<string> MSAA_NAMES = new List<string>() { "Off", "2x", "4x", "8x" };
         public static readonly List<string> FORMAT_NAMES = new List<string>() { "PNG (Lossless, Big & Slow)\nTransparency Support", "JPEG (Lossy, Small & Fast)\nNo Transparency" };
+        public static readonly List<string> STREAM_NAMES = new List<string>() { "Don't Stream", "Stream", "Stream + Images" };
         public const int FORMAT_PNG = 0;
         public const int FORMAT_JPG = 1;
+        public const int STREAM_DISABLED = 0;
+        public const int STREAM_ENABLED = 1;
+        public const int STREAM_PLUS_IMAGES = 2;
+        
 
         private static readonly int[] DEFAULT_RESOLUTION_IDX = new int[] { 1, 1, 0, 7, 2, 1, 7, 11 };
 
@@ -484,6 +491,10 @@ namespace Eosin
         JSONStorableBool encThreadsToggle;
         JSONStorableFloat numEncThreadsSlider;
 
+        private JSONStorableStringChooser streamModeChooser;
+        private JSONStorableString streamHostField;
+        private JSONStorableFloat streamPortSlider;
+
         private int myAspectRatioIdx = DEFAULT_ASPECTRATIO_IDX;
         private int myResolutionIdx = DEFAULT_RESOLUTION_IDX[DEFAULT_ASPECTRATIO_IDX];
         private int myMsaaLevel = MSAA_VALUES[DEFAULT_MSAA_IDX];
@@ -561,6 +572,10 @@ namespace Eosin
         RenderTexture previewTex, previewTexBlack, previewTexWhite;
         Texture2D blackTex, semiTex, clearTex;
         Texture2D previewBackground;
+
+        private bool streamVideoEnabled;
+        private bool saveVideoEnabled;
+        private TcpClient streamVideoClient;
 
         void DelayedInit()
         {
@@ -721,6 +736,12 @@ namespace Eosin
             
             encThreadsToggle = Utils.SetupToggle(this, "Multi-Threaded Encoding", true, true);
             numEncThreadsSlider = Utils.SetupSliderIntWithRange(this, "Encoder Thread Count", 4, 1, MAX_ENC_THREADS, true);
+            
+            streamHostField = new JSONStorableString("streamHostField", "127.0.0.1");
+            
+            streamModeChooser = Utils.SetupStringChooser(this, "Stream Mode", STREAM_NAMES, STREAM_DISABLED, true);
+            UIDynamicLabelInput streamHostInput = Utils.SetupTextInput(this, "Host", streamHostField, true);
+            streamPortSlider = Utils.SetupSliderIntWithRange(this, "Port", 54341, IPEndPoint.MinPort, IPEndPoint.MaxPort, true);
 
             Utils.SetupAction(this, "TakeSingleScreenshot", TakeSingleScreenshot);
             Utils.SetupAction(this, "StartPlaybackAndRecordVideo", StartPlaybackAndRecordVideo);
@@ -2110,6 +2131,7 @@ namespace Eosin
             {
                 pcmAudioData.Add((short)(Mathf.Clamp(Mathf.Round((float)currentBuffer[i] * maxShort), -sampleRange, sampleRange - 1)));
             }
+            
             if (audioBufferGeneric.IsCreated)
                 audioBufferGeneric.Dispose();
         }
@@ -2685,9 +2707,32 @@ namespace Eosin
 
         private void SaveRenderAsFileInternal(int fileFormat, string filename, Texture2D tex)
         {
-            filename += (fileFormat == FORMAT_JPG) ? ".jpg" : ".png";
-            byte[] bytes = (fileFormat == FORMAT_JPG) ? tex.EncodeToJPG(jpegQuality) : tex.EncodeToPNG();
-            FileManagerSecure.WriteAllBytes(myDirectory + filename, bytes);
+            if (streamVideoEnabled)
+            {
+                // Stream raw texture data to TCP socket
+                byte[] rawBytes = tex.GetRawTextureData();
+                NetworkStream vidStream = streamVideoClient.GetStream();
+                
+                try
+                {
+                    vidStream.Write(rawBytes, 0, rawBytes.Length);
+                }
+                catch (Exception ex)
+                {
+                    SuperController.LogError("Error sending frame image over socket: " + ex.Message);
+                    streamVideoEnabled = false;
+                    streamVideoClient.Close();
+                    streamVideoClient = null;
+                }
+            }
+            
+            if (saveVideoEnabled)
+            {
+                // Regular file saving
+                filename += (fileFormat == FORMAT_JPG) ? ".jpg" : ".png";
+                byte[] bytes = (fileFormat == FORMAT_JPG) ? tex.EncodeToJPG(jpegQuality) : tex.EncodeToPNG();
+                FileManagerSecure.WriteAllBytes(myDirectory + filename, bytes);
+            }
         }
 
         void BeginVRPreview()
@@ -3345,6 +3390,44 @@ namespace Eosin
             
             TextureFormat textureFormat = (myFileFormat == FORMAT_JPG || !(preserveTransparencyChooser.val && myFileFormat == FORMAT_PNG)) ? TextureFormat.RGB24 : TextureFormat.ARGB32;
 
+            switch (STREAM_NAMES.FindIndex((s) => s == streamModeChooser.val))
+            {
+                case STREAM_ENABLED:
+                    streamVideoEnabled = true;
+                    saveVideoEnabled = false;
+                    break;
+                case STREAM_PLUS_IMAGES:
+                    streamVideoEnabled = true;
+                    saveVideoEnabled = true;
+                    break;
+                default:
+                    streamVideoEnabled = false;
+                    saveVideoEnabled = true;
+                    break;
+            }
+
+            if (streamVideoEnabled)
+            {
+                string streamHost = streamHostField.val;
+                int streamPort = Mathf.Clamp((int) Math.Round(streamPortSlider.val), IPEndPoint.MinPort, IPEndPoint.MaxPort);
+                
+                SuperController.LogMessage("Sending raw image data (format: " + textureFormat + ", size: " + width + "x" + height + ", framerate: " + frameRateInt + ") to TCP socket " + streamHost + ":" + streamPort);
+
+                try
+                {
+                    streamVideoClient = new TcpClient(streamHost, streamPort);
+                }
+                catch (SocketException ex)
+                {
+                    SuperController.LogError("Error opening TCP socket: " + ex.Message);
+                    streamVideoEnabled = false;
+                }
+            }
+            else
+            {
+                streamVideoClient = null;
+            }
+
             int numEncThreads = encThreadsToggle.val ? (int) numEncThreadsSlider.val : 0;
 
             if (numEncThreads == 0)
@@ -3356,6 +3439,12 @@ namespace Eosin
             }
             else
             {
+                if (streamVideoEnabled && numEncThreads > 1)
+                {
+                    // Sending TCP data currently isn't threadsafe. Probably not much to be gained anyway.
+                    numEncThreads = 1;
+                }
+                
                 encThreadingEnabled = true;
                 finalOutputTextures = new Texture2D[numEncThreads];
                 encThreadFreeFlags = new bool[numEncThreads];
@@ -3580,6 +3669,12 @@ namespace Eosin
             finalOutputTextures = null;
             encThreadFreeFlags = null;
             encThreadSem = null;
+
+            if (streamVideoEnabled)
+            {
+                streamVideoClient.Close();
+                streamVideoClient = null;
+            }
 
             renderCamParentObj.SetActive(false);
 
